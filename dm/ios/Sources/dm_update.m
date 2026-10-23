@@ -25,6 +25,7 @@
 #import <UIKit/UIKit.h>
 #import <Network/Network.h>
 #include <stdatomic.h>
+#import "nas_sync.h"
 void plog(const char *fmt, ...);
 void dm_update_init(int own_build, void (*on_select)(void), void (*on_click)(void));   // dm/host/dm_update.c
 void dm_update_offer(int new_build, const char *note, int urgent);
@@ -130,7 +131,11 @@ static void on_click(void) {   // 宿主在游戏主线程调：玩家点了「�
         [UIApplication.sharedApplication openURL:u options:@{} completionHandler:^(BOOL ok) { plog("更新：系统%s安装链接", ok ? "已接手" : "没能打开"); }];
     });
 }
+static void on_build_click(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ dm_sync_settings_show(); });
+}
 void dm_update_boot(void) {   // main.m 起宿主前调一次 | main.m calls this once before starting the host
+    dm_update_sync_install(dm_nas_build_phase, on_build_click);
     const char *tb = getenv("DM_TEST_UPDATE_BUILD"), *tu = getenv("DM_TEST_UPDATE_URL");
     NSString *v = tb ? @(tb) : [NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"] description]; g_own = v.intValue;
     if (![v isEqualToString:[NSString stringWithFormat:@"%d", g_own]] || g_own < 0) g_own = 0;

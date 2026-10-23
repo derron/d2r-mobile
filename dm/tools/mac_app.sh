@@ -105,6 +105,7 @@ ${ICON_KEY}
 <key>LSMinimumSystemVersion</key><string>$MIN</string>
 ${DM_MAC_UPDATE_URL:+<key>SWUpdateURL</key><string>$DM_MAC_UPDATE_URL</string>
 }<key>NSHighResolutionCapable</key><true/>
+<key>NSLocalNetworkUsageDescription</key><string>Connect to your NAS to sync game saves.</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.role-playing-games</string>
 <key>GCSupportsControllerUserInteraction</key><true/>
 </dict></plist>

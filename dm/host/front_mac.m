@@ -64,7 +64,7 @@ static void app_quit(const char *why) {
     static int once; if (once++) return;
     { uint64_t dm_audio_render_calls(void); LOG("窗口：退出（%s）；声卡回调累计 %llu（0 = 这次没出声）", why, (unsigned long long)dm_audio_render_calls()); }
     int dm_ingame_now(void); int dm_save_wait(double max_s, uint64_t *commits, int *froze, double *ms);
-    if (!dm_ingame_now() && !dm_uiscreen_ingame()) { LOG("窗口：退出（不在局内，没有待存的进度）"); dm_host_shutdown(why); return; }
+    if (!dm_ingame_now() && !dm_uiscreen_ingame()) { LOG("窗口：退出（不在局内，没有待存的进度）"); int dm_cloud_flush_wait(double); dm_cloud_flush_wait(10); dm_host_shutdown(why); return; }
     uint64_t n = 0; int froze = 0; double ms = 0; int asked = dm_save_wait(3, &n, &froze, &ms);
     if (n && asked) LOG("窗口：退出前等游戏存盘 %.0f ms，期间存档提交 %llu 次%s", ms, (unsigned long long)n, froze ? "（原先暂停着：冻结世界存盘、已恢复暂停）" : "");
     else LOG("【红】窗口：未存盘退出——3 秒内没等到存档提交（%s%s）", asked ? "已请游戏存盘" : "一直没到能请存盘的状态（读取画面？）", froze ? "，原先暂停着、冻结放开过" : "");
@@ -134,6 +134,7 @@ double front_display_refresh(char *name, size_t n) {
 - (void)windowDidChangeBackingProperties:(NSNotification *)n { (void)n; layout_game(); }
 - (void)windowDidChangeScreen:(NSNotification *)n { (void)n; screen_note(); }
 - (void)quit:(id)s { (void)s; app_quit("菜单退出"); }
+- (void)syncSettings:(id)s { (void)s; void dm_sync_settings_show(void); dm_sync_settings_show(); }
 - (void)keys:(id)s { (void)s; show_keys(); }
 - (void)share:(id)s { (void)s; share_logs_ui(); }
 @end
@@ -214,10 +215,13 @@ void front_run(void (*guest)(void)) {
         { // 菜单栏：应用（退出 ⌘Q）/ 显示（全屏 ⌃⌘F）/ 帮助（键位对照） | Menu bar: application (Quit ⌘Q) / View (Full Screen ⌃⌘F) / Help (key mapping)
           NSMenu *bar = [NSMenu new];
           NSMenu *(^add)(const char *) = ^NSMenu *(const char *t) { NSMenuItem *it = [NSMenuItem new]; [bar addItem:it]; NSMenu *m = [[NSMenu alloc] initWithTitle:@(t)]; it.submenu = m; return m; };
-          [[add("") addItemWithTitle:@(ui("dmAppQuit")) action:@selector(quit:) keyEquivalent:@"q"] setTarget:ctl];
+          NSMenu *appMenu = add("");
+          [[appMenu addItemWithTitle:@(ui("dmNasTitle")) action:@selector(syncSettings:) keyEquivalent:@","] setTarget:ctl];
+          [[appMenu addItemWithTitle:@(ui("dmAppQuit")) action:@selector(quit:) keyEquivalent:@"q"] setTarget:ctl];
           NSMenuItem *fs = [add(ui("dmAppMenuView")) addItemWithTitle:@(ui("dmAppFullscreen")) action:@selector(toggleFullScreen:) keyEquivalent:@"f"]; fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
           { NSMenu *hm = add(ui("dmAppMenuHelp")); [[hm addItemWithTitle:@(ui("dmAppKeysTitle")) action:@selector(keys:) keyEquivalent:@""] setTarget:ctl]; [[hm addItemWithTitle:@(ui("dmAppShareLog")) action:@selector(share:) keyEquivalent:@""] setTarget:ctl]; }
-          NSApp.mainMenu = bar; }
+          NSApp.mainMenu = bar;
+          [NSNotificationCenter.defaultCenter addObserverForName:@"DMSaveSyncNeedsRestart" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { NSAlert *a = [NSAlert new]; a.messageText = @(ui("dmNasTitle")); a.informativeText = n.object; [a addButtonWithTitle:@(ui("dmAppOK"))]; [a runModal]; }]; }
         { void dm_gamepad_start(void (*on_mode)(int pad)); dm_gamepad_start(NULL); }   // 手柄（与 iOS 壳共用 ios/Sources/dm_gamepad.m）：连上即用，与键盘并存 | Gamepad (ios/Sources/dm_gamepad.m, shared with the iOS shell): works as soon as it is connected, alongside the keyboard
         [win makeKeyAndOrderFront:nil];
         screen_note();

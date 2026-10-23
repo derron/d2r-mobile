@@ -35,7 +35,8 @@ static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off) {
     if (g_mode == 2 && g_calls == 1 && n > 3) n = 3;
     return pwrite(fd, buf, n, off);
 }
-static int fails, checks;
+static int fails, checks, sync_commits;
+static void sync_commit(const char *dir) { (void)dir; sync_commits++; }
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("  ✗ "); } else printf("  ✓ "); printf(__VA_ARGS__); printf("\n"); } while (0)
 static void put(const char *p, const char *s) { FILE *f = fopen(p, "w"); fputs(s, f); fclose(f); }
 static int same(const char *p, const char *s) {
@@ -73,6 +74,7 @@ static int test_holes(void) {
     return bad;
 }
 int main(void) {
+    g_dm_save_commit_hook = sync_commit;
     if (test_holes()) return 1;
     char root[1024], save[1100], work[1200], p[1200];
     const char *sp = getenv("TMPDIR"); snprintf(root, sizeof root, "%s/t_fs.XXXXXX", sp ? sp : "/private/tmp");
@@ -150,6 +152,7 @@ int main(void) {
     // 6a Recloning after a refused commit fails: do not exit, the work directory is untouched and the committed version unchanged; the next commit is refused again and the reclone succeeds; the transaction after that commits normally
     setenv("DM_TEST_FS_FAILAT", "reclone:1", 1);
     CHECK(write_save("save:/a", "bad") == RES_OK, "写 a=bad");
+    int sync_before_poison = sync_commits;
     dm_fs_save_poison(ENOSPC); int nf0 = g_nfail;
     CHECK(h_fs_Commit("save") == RES_FAIL && g_nfail == nf0 + 1, "本事务被拒（重新克隆注入失败），进程还在，前端通知 1 次");
     snprintf(p, sizeof p, "%s/a", save); CHECK(same(p, "new"), "已提交目录 a 仍是 new");
@@ -157,6 +160,7 @@ int main(void) {
     CHECK(h_fs_Commit("save") == RES_FAIL && g_nfail == nf0 + 2, "仍是已污染：下一次提交照样拒绝");
     snprintf(p, sizeof p, "%s/a", work); CHECK(same(p, "new"), "这次重新克隆成了：工作目录 a 回到 new");
     snprintf(p, sizeof p, "%s.re", work); CHECK(access(p, F_OK) != 0, "没有 .re 残留");
+    CHECK(sync_commits == sync_before_poison, "失败提交不调用存档同步钩子");
     CHECK(write_save("save:/a", "good") == RES_OK && h_fs_Commit("save") == RES_OK, "下一个事务写 a=good，提交成功");
     snprintf(p, sizeof p, "%s/a", save); CHECK(same(p, "good"), "已提交 a = good");
     // ⑥b 改名后写客体名失败、回退也失败：不退出；文件在事务存档里 → 本事务提交被拒、已提交版不变；重新克隆后照常

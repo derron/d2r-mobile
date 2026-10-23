@@ -1,0 +1,3 @@
+/* 系统权限文字，来源 ui_text.tsv 的 dmNasLocalNetworkPurpose。
+   System permission text from dmNasLocalNetworkPurpose in ui_text.tsv. */
+"NSLocalNetworkUsageDescription" = "用于连接你的 NAS 并同步游戏存档。";

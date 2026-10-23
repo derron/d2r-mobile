@@ -22,6 +22,7 @@ void dm_gamepad_start(void (*on_mode)(int pad)); void dm_gamepad_touched(void); 
 #include "dm_actions.h"
 #include <stdatomic.h>
 #include "dm_touch_game_state.h"
+#include "../../host/dm_build_sync.h"
 #include "../../host/dm_cursor.h"
 #include "../../host/dm_hud.h"
 #include "../../host/dm_world.h"
@@ -124,6 +125,8 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {}
 @end
 @implementation DmMetalView {
+    UITouch *_buildFinger;
+    dm_build_tap _buildTap;
     UITouch *_slot[16];   // 强引用（真机 SIGSEGV：原先不保留，某条路径没清槽时手指对象已释放，下次 pushFrom 读它就崩）。所有结束 / 取消路径都要清槽 | Strong references (real-device SIGSEGV: previously not retained, so when some path failed to clear the slot the finger object was already released and the next pushFrom crashed reading it). All end / cancel paths must clear the slot
     dm_tc_state _controls;
     DmTouchOverlay *_overlay;
@@ -264,6 +267,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     [_overlay setNeedsDisplay];
 }
 - (void)cancelControlsFrom:(const char *)source {
+    _buildTap.cancelled = 1;
     _pendEnd=nil; _finalAsked=NO;
     for(int i_=0;i_<16;i_++) _slot[i_]=nil; dm_tc_cancel_all(&_controls); [self pushFrom:source phase:"none"];
     if(_uiDragOn) { _uiDragOn=NO; dm_ui_drag_end(); }
@@ -490,7 +494,32 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
 // Backstop (not treated as the root fix): scan before every press -- if a finger in a slot or recorded separately is already Ended / Cancelled (except _pendEnd, which is pending release),
 // some end path missed its cleanup: close it as cancelled and log one line (this line appearing = there is still an unfound path that misses cleanup; it includes which slot and which kind of finger)
 static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouchPhaseEnded || ph==UITouchPhaseCancelled; }
+- (NSSet<UITouch *> *)syncBuildTouches:(NSSet<UITouch *> *)ts phase:(int)phase {
+    CGRect bounds = self.bounds; float rect[4];
+    BOOL frontend = atomic_load(&g_touch_frontend) && !self.window.rootViewController.presentedViewController;
+    BOOL visible = frontend && bounds.size.width > 0 && bounds.size.height > 0 && dm_update_build_rect(rect);
+    if (phase == 0 && !_buildFinger && visible) {
+        for (UITouch *finger in ts) {
+            CGPoint p = [finger locationInView:self];
+            if (dm_build_rect_contains(rect, p.x / bounds.size.width, p.y / bounds.size.height)) {
+                _buildFinger = finger; dm_build_tap_begin(&_buildTap, p.x, p.y); break;
+            }
+        }
+    }
+    UITouch *finger = _buildFinger;
+    if (!finger || ![ts containsObject:finger]) return ts;
+    CGPoint p = [finger locationInView:self];
+    dm_build_tap_move(&_buildTap, p.x, p.y);
+    if (!visible || phase == 3) _buildTap.cancelled = 1;
+    BOOL open = phase == 2 && !_buildTap.cancelled && visible
+                && dm_build_rect_contains(rect, p.x / bounds.size.width, p.y / bounds.size.height);
+    NSMutableSet *rest = [ts mutableCopy]; [rest removeObject:finger];
+    if (phase == 2 || phase == 3) _buildFinger = nil;
+    if (open) dm_update_build_open();
+    return rest;
+}
 - (void)sweepEndedSlots {
+    if (_buildFinger && touch_done(_buildFinger)) _buildFinger = nil;
     for(int i=0;i<16;i++) if(_slot[i] && _slot[i]!=_pendEnd && touch_done(_slot[i])) {
         LOG("前端：【红】清理残留触摸槽 %d（%s，阶段 %d，控件层 %s）", i, [_slot[i] isKindOfClass:DmScriptTouch.class] ? "脚本触摸" : "真触摸", (int)_slot[i].phase, _navigation ? "面板态" : "游戏态");
         if(_uiDragOn && _controls.pointer_slot==i) { _uiDragOn=NO; dm_ui_drag_end(); }
@@ -504,6 +533,7 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     (void)e;
     [self sweepEndedSlots];
+    ts = [self syncBuildTouches:ts phase:0]; if (!ts.count) return;
     // 手柄模式下碰屏幕 = 回触屏模式（dm_gamepad.m），这一下只做这一件事：此刻屏上是手柄版界面，触屏控件还没显示出来（布局重载要几十帧），
     // 照常往下走的话，落点正好在看不见的回城钮 / 技能钮位置就会直接回城、放技能，面板态还会对手柄版面板发点击。
     // Touching the screen in controller mode = back to touch mode (dm_gamepad.m), and this touch does that one thing only: at this moment the
@@ -537,6 +567,7 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
 }
 - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     (void)e;
+    ts = [self syncBuildTouches:ts phase:1]; if (!ts.count) return;
     if(_swallow.count) { NSMutableSet *r=[ts mutableCopy]; for(UITouch *t in ts) if([_swallow containsObject:t]) [r removeObject:t]; if(!r.count) return; ts=r; }
     if(atomic_load(&g_touch_frontend)) { [self uiTouch:ts phase:1]; return; }
     UITouch *uf=_uiFinger;
@@ -579,6 +610,7 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
     }
 }
 - (void)finishTouches:(NSSet<UITouch *> *)ts phase:(const char *)phase {
+    ts = [self syncBuildTouches:ts phase:!strcmp(phase, "cancelled") ? 3 : 2]; if (!ts.count) return;
     if(_swallow.count) { NSMutableSet *r=[ts mutableCopy]; for(UITouch *t in ts) if([_swallow containsObject:t]) { [r removeObject:t]; [_swallow removeObject:t]; } if(!r.count) return; ts=r; }   // 手柄模式下落下的那根：抬起也不交 | The touch that landed in controller mode: its lift is not passed on either
     // 界面手指那一根交给 uiTouch，其余照常结束、清槽（真机 SIGSEGV：原先 _uiFinger 在就整批交走 return，局内手指的槽留下已释放的触摸）
     // Hand the UI finger to uiTouch and end the rest as usual, clearing their slots (real-device SIGSEGV: previously, if _uiFinger was present the whole batch was handed over and return, leaving released touches in the slots of in-run fingers)

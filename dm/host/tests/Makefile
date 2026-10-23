@@ -15,6 +15,7 @@ run: \
 	$(B)/t_altstack \
 	$(B)/t_audio \
 	$(B)/t_audio_spsc \
+	$(B)/t_build_sync \
 	$(B)/t_cloudsync \
 	$(B)/t_condvar \
 	$(B)/t_condvar_old \
@@ -57,6 +58,7 @@ run: \
 	python3 ../../ios/tools/dm_i18n.py --check
 	python3 ../../i18n/scan_literals.py
 	$(B)/t_thread_leak
+	$(B)/t_build_sync
 	$(B)/t_loader_weak
 	$(B)/t_mac_overlay
 	$(PY) test_mac_features.py
@@ -102,6 +104,8 @@ $(B)/t_i18n: t_i18n.c ../dm_i18n.c ../dm_i18n.h ../dm_i18n_tab.h | $(B)
 	clang -O1 -Wall -Werror -I.. -o $@ t_i18n.c ../dm_i18n.c
 $(B)/t_mac_overlay: t_mac_overlay.m ../app_mac_overlay.h | $(B)
 	clang -O1 -Wall -Werror -fobjc-arc -framework Foundation -o $@ t_mac_overlay.m
+$(B)/t_build_sync: t_build_sync.c ../dm_build_sync.h ../dm_update.c | $(B)
+	clang -O1 -Wall -Werror -o $@ t_build_sync.c
 $(B)/t_hud_dead: t_hud_dead.c ../dm_hud.h | $(B)
 	clang -O1 -Wall -Werror -I.. -o $@ t_hud_dead.c
 $(B)/t_textbox: t_textbox.c ../dm_textbox_core.c ../dm_textbox_core.h | $(B)

@@ -16,15 +16,34 @@
 #include "dm.h"
 #include "dm_i18n.h"
 #include "dm_cursor.h"
+#include "dm_build_sync.h"
+#include "dm_uiscreen.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <time.h>
 #include <TargetConditionals.h>
 
 static int g_own = -1; static void (*g_on_select)(void), (*g_on_click)(void);
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static struct { int build, urgent; char note[160]; } g_offer;   // g_mu 护 g_offer | g_mu guards g_offer
 static _Atomic int g_safe_l = -1, g_dirty, g_click, g_appear, g_fg;   // g_safe_l < 0 = 外壳还没给左安全区，先不写字（免得字先出在安全区里再跳一下）。g_dirty：还要重写几帧（>0 时每帧找控件、写字、摆位置；写完一次后再跟 30 帧，等文字框量出新宽度） | g_safe_l < 0 = the shell has not supplied the left safe area yet, so do not write text for now (to avoid the text first showing inside the safe area and then jumping). g_dirty: how many more frames to rewrite (when >0, every frame find widgets, write text, set positions; after one write keep following for 30 more frames, waiting for the text box to measure the new width)
+static dm_sync_phase (*g_sync_phase)(void);
+static void (*g_open_sync)(void);
+static float g_build_rect[4];
+static uint64_t g_build_rect_time;
+static uint32_t g_build_rect_gen;
+void dm_update_sync_install(dm_sync_phase (*phase)(void), void (*open_settings)(void)) {
+    g_sync_phase = phase; g_open_sync = open_settings;
+}
+int dm_update_build_rect(float rect[4]) {
+    pthread_mutex_lock(&g_mu);
+    int valid = g_build_rect_time && g_build_rect_gen == dm_ui_gen()
+                && clock_gettime_nsec_np(CLOCK_MONOTONIC) - g_build_rect_time < UINT64_C(250000000);
+    if (valid) memcpy(rect, g_build_rect, sizeof g_build_rect);
+    pthread_mutex_unlock(&g_mu); return valid;
+}
+void dm_update_build_open(void) { if (g_open_sync) g_open_sync(); }
 
 void dm_update_init(int own_build, void (*on_select)(void), void (*on_click)(void)) { g_own = own_build; g_on_select = on_select; g_on_click = on_click; atomic_store(&g_dirty, 30); }   // 不在这里置「选角页出现」：启动时游戏自己会发一次 OpenPanel CharacterSelectPanel，这里再置就每次启动查两遍 | Do not set "character select page appears" here: at startup the game sends OpenPanel CharacterSelectPanel once by itself, and setting it here too would check twice on every startup
 // 外壳查完的结果：任意线程调。new_build > 0 = 有比自己新的构建（note = 一句话更新说明，UTF-8；urgent = 建议立即更新）；0 = 没有，撤掉已有提示
@@ -69,8 +88,82 @@ static void set_text(uint8_t *b, uint64_t w, const char *s);
 static void place(uint64_t w, int x, int y) {   // 矩形 x / y 在 +0x70 / +0x74；改完照原版补一次虚表 +0x10 让它重算（同 dm_cursor.c 安全区那处） | Rectangle x / y at +0x70 / +0x74; after changing them, call vtable +0x10 once as the original game does so it recomputes (same as the safe area site in dm_cursor.c)
     int32_t *r = (int32_t *)(w + 0x70); if (r[0] == x && r[1] == y) return; r[0] = x; r[1] = y; ((void (*)(uint64_t))*(uint64_t *)(*(uint64_t *)w + 0x10))(w);
 }
+static void publish_build_rect(uint8_t *b, uint64_t root, uint64_t mm, uint64_t bw) {
+    int dm_padmode_busy(void);
+    int visible = b && root && mm && bw && !dm_ui_unstable() && !dm_uiscreen_ingame() && !dm_padmode_busy()
+                  && *(uint8_t *)(mm + 0x50) && *(uint8_t *)(bw + 0x50);
+    if (visible) {
+        uint64_t ch = *(uint64_t *)(root + 0x58), n = *(uint64_t *)(root + 0x60);
+        if (!ch || n > 256) visible = 0;
+        for (uint64_t i = 0; visible && i < n; i++) {
+            uint64_t w = *(uint64_t *)(ch + i * 8);
+            const char *name = w ? *(const char **)(w + 8) : NULL;
+            if (!name || !*(uint8_t *)(w + 0x50)) continue;
+            if (!strcmp(name, "CharacterCreatePanel") || !strcmp(name, "CharacterOptionsPanel") || !strcmp(name, "SettingsPanel")
+                || strstr(name, "Modal") || strstr(name, "Confirm") || strstr(name, "Dialog")) visible = 0;
+        }
+    }
+    float rect[4] = {0};
+    if (visible) {
+        int vw = *(int32_t *)(b + 0x211da38), vh = *(int32_t *)(b + 0x211da3c);
+        const int32_t *r = (const int32_t *)(bw + 0x70);
+        visible = vw > 0 && vh > 0 && r[2] > 0 && r[3] > 0;
+        if (visible) {
+            // TouchBuild 是 MainMenuPanel 下无锚点的直接子控件，实际布局矩形已包含安全区与模式定位。
+            // TouchBuild is our unanchored direct child of MainMenuPanel. Its
+            // actual layout rect already includes the safe-area/mode placement.
+            float width = (float)vw * 2160 / vh;
+            rect[0] = r[0] / width; rect[1] = r[1] / 2160.0f;
+            rect[2] = (r[0] + r[2]) / width; rect[3] = (r[1] + r[3]) / 2160.0f;
+            // 构建文本框的空白尾部与更新提示重叠，不能拦截提示的点击。
+            // The build textbox has spare width that overlaps the adjacent
+            // update notice. Its blank tail must not steal that notice's taps.
+            uint64_t note = find(mm, "TouchUpdNote", 0);
+            if (note) {
+                const int32_t *nr = (const int32_t *)(note + 0x70);
+                if (nr[0] > r[0] && nr[1] < r[1] + r[3] && nr[1] + nr[3] > r[1] && nr[0] / width < rect[2]) rect[2] = nr[0] / width;
+            }
+            visible = rect[0] >= 0 && rect[1] >= 0 && rect[2] <= 1 && rect[3] <= 1;
+        }
+    }
+    pthread_mutex_lock(&g_mu);
+    memcpy(g_build_rect, rect, sizeof rect);
+    g_build_rect_gen = dm_ui_gen();
+    g_build_rect_time = visible ? clock_gettime_nsec_np(CLOCK_MONOTONIC) : 0;
+    pthread_mutex_unlock(&g_mu);
+}
+static const char *sync_caption(dm_sync_phase phase) {
+    switch (phase) {
+        case DM_SYNC_UPLOAD: return "dmSyncUpload";
+        case DM_SYNC_DOWNLOAD: return "dmSyncDownload";
+        case DM_SYNC_CHARACTER_UPLOAD: return "dmSyncCharacterUpload";
+        case DM_SYNC_STASH_UPLOAD: return "dmSyncStashUpload";
+        case DM_SYNC_CHARACTER_DOWNLOAD: return "dmSyncCharacterDownload";
+        case DM_SYNC_STASH_DOWNLOAD: return "dmSyncStashDownload";
+        case DM_SYNC_VERIFY: return "dmSyncCheck";
+        case DM_SYNC_CHARACTER_COMPLETE: return "dmSyncCharacterComplete";
+        case DM_SYNC_STASH_COMPLETE: return "dmSyncStashComplete";
+        case DM_SYNC_COMPLETE: return "dmSyncComplete";
+        default: return NULL;
+    }
+}
 void dm_update_pump(void) {   // 取手柄处每帧调（游戏主线程） | Called every frame at the controller poll (game main thread)
     if (g_own < 0) return;
+    dm_sync_phase phase = g_sync_phase ? g_sync_phase() : DM_SYNC_BUILD;
+    static dm_sync_phase previous_phase;
+    if (phase != previous_phase) { previous_phase = phase; atomic_store(&g_dirty, 30); }
+    // 文字未变时也更新可见性。游戏指针不离开本线程，菜单停止或重建后不保留过期点击区域。
+    // Refresh visibility even when the caption is not dirty. No guest pointers
+    // leave this thread; a stopped/rebuilt menu cannot retain a stale hit target.
+    if (g_sync_phase) {
+        int dm_padmode_busy(void);
+        if (dm_ui_unstable() || dm_uiscreen_ingame() || dm_padmode_busy()) {
+            publish_build_rect(NULL, 0, 0, 0); return;
+        }
+        uint8_t *b = tb(); uint64_t root = b ? *(uint64_t *)(b + 0x2f05458) : 0;
+        uint64_t mm = root ? find(root, "MainMenuPanel", 0) : 0, bw = mm ? find(mm, "TouchBuild", 0) : 0;
+        publish_build_rect(b, root, mm, bw);
+    }
     if (atomic_exchange(&g_click, 0)) { LOG("更新：点了「更新」按钮"); if (g_on_click) g_on_click(); }
     // 手柄模式（原版手柄主菜单，没有光标点不了按钮）：有新版本提示、人停在主菜单（选角列表没开、没在建角）时，Y = 更新；「Y 更新」写在提示字那一行末尾（原版主菜单的提示条每帧由它自己重建，加进去的条目留不住）
     // Controller mode (the original controller main menu, which has no cursor to tap buttons with): when there is a new version notice and the player is on the main menu (character list not open, not creating a character), Y = update; "Y Update" is written at the end of the hint text line (the original main menu's legend is rebuilt by itself every frame, so an entry added to it does not stay)
@@ -89,7 +182,9 @@ void dm_update_pump(void) {   // 取手柄处每帧调（游戏主线程） | Ca
     if (atomic_load(&g_safe_l) < 0) return;
     atomic_compare_exchange_strong(&g_dirty, &left, left - 1);   // 期间又被置回 30（新结果 / 面板重建）就不减 | If it was set back to 30 in the meantime (new result / panel rebuilt), do not decrement
     int build, urgent; char note[160]; pthread_mutex_lock(&g_mu); build = g_offer.build; urgent = g_offer.urgent; memcpy(note, g_offer.note, sizeof note); pthread_mutex_unlock(&g_mu);
-    char t[256]; snprintf(t, sizeof t, dm_str(b, "dmUpdBuild"), g_own); set_text(b, bw, t);
+    char t[256]; snprintf(t, sizeof t, dm_str(b, "dmUpdBuild"), g_own);
+    const char *sync_key = sync_caption(phase);
+    set_text(b, bw, sync_key ? dm_ui(sync_key) : t);
     int sl = atomic_load(&g_safe_l), bx = sl + 6 > 79 ? sl + 6 : 79; int dm_padmode_current(void); int pad = dm_padmode_current();
     // 手柄模式（原版手柄主菜单）：左下角是原版的按钮栏和提示条，这两行改放右上角、靠右对齐。原版手柄主菜单面板的矩形是 0×0（锚点无从算起），
     // 这份控件在布局里不带锚点（touch_layout.pad_mainmenu），位置全由这里按屏宽（布局单位：2160 = 屏高）算
@@ -97,6 +192,7 @@ void dm_update_pump(void) {   // 取手柄处每帧调（游戏主线程） | Ca
     // so these widgets carry no anchor in the layout (touch_layout.pad_mainmenu), and their position is computed entirely here from the screen width (layout units: 2160 = screen height)
     int vw = *(int32_t *)(b + 0x211da38), vh = *(int32_t *)(b + 0x211da3c), xr = vh > 0 ? (int)((long)vw * 2160 / vh) : 3840;
     if (pad) place(bw, xr - 420 - bx, 60); else place(bw, bx, 2046);
+    if (g_sync_phase) publish_build_rect(b, root, mm, bw);
   // 触屏：左下角那行，离屏幕左边 79 单位，有安全区时贴安全线内 6 单位
   // Touch: the line at the bottom left, 79 units from the left edge of the screen, or 6 units inside the safe line when there is a safe area
     uint64_t nt = find(mm, "TouchUpdNote", 0), sm = find(mm, "TouchUpdSmall", 0), bg = find(mm, "TouchUpdBg", 0), ti = find(mm, "TouchUpdTitle", 0), de = find(mm, "TouchUpdDesc", 0), big = find(mm, "TouchUpdBig", 0);

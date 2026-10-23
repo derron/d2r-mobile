@@ -1,20 +1,20 @@
 // iCloud 存档同步的 iOS 一侧：拿 iCloud 容器目录、让云端的包先下载好，再调共用核心 dm_cloud_sync（dm/host/dm_cloudsync.c）。
-// 启动：dm_cloud_boot 在 boot_thread 里、dm_main 挂存档之前调，最多等 5 秒，拉云端各包、按「后写覆盖先写」换进本地存档，之后游戏照常读存档列表。
+// 启动：dm_icloud_boot 在 boot_thread 里、dm_main 挂存档之前调，最多等 5 秒，拉云端各包、按「后写覆盖先写」换进本地存档，之后游戏照常读存档列表。
 // 运行中：存档每提交成功一次（hle_fs.c 的 Commit），提交钩子先把已提交目录 clonefile 成快照（写时复制，近乎零成本）；局内只记成待传，出局 / 切后台时在串行队列里把快照与云端对比、只上传（allow_down = 0）；不在局内的提交当场传。
 // 只同步玩家真实存档 Documents/save；测试存档（save.test 等）缺省不同步。测试开关 DM_TEST_ICLOUD_SUB=<子目录名>：测试存档也同步，云端用容器里的这个子目录（与真实存档的 saves 隔开，不会把测试角色传到玩家设备上）。
 // 测试开关 DM_TEST_ICLOUD_DIR=<本地目录>：用本地目录当云端（不碰 iCloud），测试存档也同步。不以 / 开头的路径拼到 App 的 Documents 下（下同）。
 // 测试开关 DM_TEST_ICLOUD_ROOT=<本地目录>：用本地目录当 iCloud 容器的 Documents（下有 saves / saves_v2），验目录换代与一次性迁移；测试存档也同步。
 // Mac 原生 App（宿主 app_mac.m 包成的那个）也编这个文件，同一个容器、同一套规则：真实存档 = 应用支持目录下的 save（启动代码设 DM_CLOUD_REAL=1；
-// 带 DM_APP_SUPPORT 起的测试局不设，一律当测试存档、不同步）；没有「切后台」，改成退出 App 前传一次并等它传完（dm_cloud_flush_wait）。
+// 带 DM_APP_SUPPORT 起的测试局不设，一律当测试存档、不同步）；没有「切后台」，改成退出 App 前传一次并等它传完（dm_icloud_flush_wait）。
 // 开关：「自定义」页 icloud（缺省开）。没登录 iCloud / 本 App 的 iCloud 被关：取不到容器，整套跳过，日志记一行。
 // The iOS side of iCloud save sync: obtain the iCloud container directory, let the cloud packages download first, then call the shared core dm_cloud_sync (dm/host/dm_cloudsync.c).
-// Startup: dm_cloud_boot is called in boot_thread, before dm_main mounts the save; it waits at most 5 seconds, pulls each cloud package and swaps it into the local save by "last write wins", after which the game reads the save list as usual.
+// Startup: dm_icloud_boot is called in boot_thread, before dm_main mounts the save; it waits at most 5 seconds, pulls each cloud package and swaps it into the local save by "last write wins", after which the game reads the save list as usual.
 // While running: every time a save commit succeeds (Commit in hle_fs.c), the commit hook first clonefiles the committed directory into a snapshot (copy-on-write, nearly free); in game it is only marked as pending, and on leaving the game / going to the background the snapshot is compared with the cloud on a serial queue and only uploaded (allow_down = 0); commits outside a game are uploaded on the spot.
 // Only the player's real save Documents/save is synced; test saves (save.test and so on) are not synced by default. Test switch DM_TEST_ICLOUD_SUB=<subdirectory name>: test saves are synced as well, using this subdirectory of the container in the cloud (separate from the saves of the real save, so test characters are not sent to the player's devices).
 // Test switch DM_TEST_ICLOUD_DIR=<local directory>: use a local directory as the cloud (iCloud is not touched); test saves are synced as well. A path not starting with / is joined under the App's Documents (same below).
 // Test switch DM_TEST_ICLOUD_ROOT=<local directory>: use a local directory as the Documents of the iCloud container (with saves / saves_v2 under it), to verify the directory generation change and the one-time migration; test saves are synced as well.
 // The native Mac App (the one the host's app_mac.m is wrapped into) compiles this file too, with the same container and the same rules: the real save = save under the application support directory (the startup code sets DM_CLOUD_REAL=1;
-// test runs launched with DM_APP_SUPPORT do not set it and are always treated as test saves, not synced); there is no "going to the background", so it uploads once before quitting the App and waits for it to finish (dm_cloud_flush_wait).
+// test runs launched with DM_APP_SUPPORT do not set it and are always treated as test saves, not synced); there is no "going to the background", so it uploads once before quitting the App and waits for it to finish (dm_icloud_flush_wait).
 // Switch: icloud on the Custom page (on by default). Not signed in to iCloud / iCloud turned off for this App: the container cannot be obtained, the whole thing is skipped, and one line is logged.
 #import <Foundation/Foundation.h>
 #include <TargetConditionals.h>
@@ -95,12 +95,12 @@ static int run_sync(NSString *save, int down) {   // 在文件协调里做：iCl
 }
 // 存档提交钩子（hle_fs.c，持着存档锁调）：只做快照，其余放队列。
 // 局内（58 分钟提交 127 次、上传 97 次，平均 35 秒碰一次网）：只留最新那份快照记成「待传」，不上传；
-// 退出这一局回到前端（主菜单 / 选角页）、切到后台时各传一次（dm_cloud_flush）。不在局内（选角 / 建角 / 删角色）的提交照旧当场传——
+// 退出这一局回到前端（主菜单 / 选角页）、切到后台时各传一次（dm_icloud_flush）。不在局内（选角 / 建角 / 删角色）的提交照旧当场传——
 // 删角色只在选角页发生，拖到以后传的话被强杀后再启动会把删掉的角色从云端拉回来（启动同步把「本地没了」当丢失、从云端拿回）。
 // 被强杀 / 崩溃没来得及传：待传快照随之作废（启动时清掉），启动那次同步看到本地自上次同步后改过、云端没变，照常补传（dm_cloudsync.c lchg && !cchg → UP）
 // Save commit hook (hle_fs.c, called while holding the save lock): only takes a snapshot, the rest goes to the queue.
 // In a run (127 commits and 97 uploads in 58 minutes, touching the network every 35 seconds on average): keep only the newest snapshot marked as "pending upload", do not upload;
-// upload once each when leaving the run back to the front end (main menu / character select page) and when going to background (dm_cloud_flush). Commits outside a run (character select / create / delete character) are still uploaded on the spot --
+// upload once each when leaving the run back to the front end (main menu / character select page) and when going to background (dm_icloud_flush). Commits outside a run (character select / create / delete character) are still uploaded on the spot --
 // character deletion only happens on the character select page; if deferred, a force-kill followed by a relaunch would pull the deleted character back from the cloud (startup sync treats "missing locally" as lost and restores it from the cloud).
 // Force-killed / crashed before uploading: the pending snapshot is voided with it (cleared at startup), and the startup sync sees local changed since the last sync and cloud unchanged, so it uploads as usual (dm_cloudsync.c lchg && !cchg → UP)
 static NSString *g_pend;          // 局内最新一次提交的快照（只在 g_q 上读写） | Snapshot of the newest commit in the run (read and written only on g_q)
@@ -123,7 +123,7 @@ static void on_commit(const char *commit_dir) {
 }
 // 出局 / 切后台：把局内攒下的最新一份传掉。切后台用系统给的后台收尾时间，传完才结束（最多约 30 秒，系统到点前会叫停）
 // Leaving a run / going to background: upload the newest copy accumulated during the run. Going to background uses the background completion time granted by the system and ends only after the upload finishes (about 30 seconds at most; the system calls a stop before time is up)
-void dm_cloud_flush(int background) {
+void dm_icloud_flush(int background) {
     if (!g_q) return;   // 没开同步（测试存档 / 没登录 iCloud / 自定义页关了） | Sync not enabled (test save / not signed in to iCloud / turned off on the Custom page)
     if (background) atomic_store(&g_bg, 1);
 #if TARGET_OS_IPHONE
@@ -141,16 +141,16 @@ void dm_cloud_flush(int background) {
 }
 // 退出 App 前（Mac）：把局内攒下的最新一份传掉，并等队列里的活做完，最多 sec 秒。返回 1 = 做完了（或本来就没开同步），0 = 到点还没完
 // Before quitting the App (Mac): upload the latest copy accumulated during the game and wait for the queued work to finish, at most sec seconds. Returns 1 = done (or sync was not on in the first place), 0 = not finished in time
-int dm_cloud_flush_wait(double sec) {
+int dm_icloud_flush_wait(double sec) {
     if (!g_q) return 1;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_async(g_q, ^{ NSString *p = g_pend; g_pend = nil; if (p) upload_snap(p, "退出 App 前，"); else LOG("iCloud 同步：退出 App 前，没有待传的存档"); dispatch_semaphore_signal(done); });
     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)))) { LOG("【红】iCloud 同步：退出 App 前 %.0f 秒没传完（没传完的下次启动补传）", sec); return 0; }
     return 1;
 }
-void dm_cloud_foreground(void) { atomic_store(&g_bg, 0); }
+void dm_icloud_foreground(void) { atomic_store(&g_bg, 0); }
 static void cloud_ingame(int on) { if (on) atomic_store(&g_session, 1); }
-static void cloud_charsel(void) { if (atomic_exchange(&g_session, 0)) dm_cloud_flush(0); }   // 退出这一局回到前端（主菜单 / 选角页）：这一局结束 | Left this run back to the front end (main menu / character select page): this run has ended
+static void cloud_charsel(void) { if (atomic_exchange(&g_session, 0)) dm_icloud_flush(0); }   // 退出这一局回到前端（主菜单 / 选角页）：这一局结束 | Left this run back to the front end (main menu / character select page): this run has ended
 
 static NSURL *container(double limit) {   // 取 iCloud 容器：要在主线程以外调，第一次可能要等系统建目录；取不到返回 nil 并记原因 | Get the iCloud container: must be called off the main thread; the first time may have to wait for the system to create the directory; returns nil and logs the reason if it cannot be obtained
     __block NSURL *ct = nil; dispatch_semaphore_t got = dispatch_semaphore_create(0);
@@ -240,10 +240,10 @@ static int first_listing_ok(double deadline) {
     if (e) { sscanf(e, "%d,%d,%d,%d", &got, &listed, &present, &net); }
     else {
         __block int g = 0, n = 0, pr = 0; dispatch_semaphore_t sem = dispatch_semaphore_create(0); __block NSMetadataQuery *q = nil; __block id obs = nil;
-        // 元数据查询要挂在有运行循环的线程上。iOS 外壳在 boot 子线程上调 dm_cloud_boot，派发到主线程没问题；
+        // 元数据查询要挂在有运行循环的线程上。iOS 外壳在 boot 子线程上调 dm_icloud_boot，派发到主线程没问题；
         // 但 Mac 宿主在 main() 主线程上直接调（main.c），此时主线程还没进 run loop——派发到主线程自己再等它就是死锁（永远「收集未完成」）。
         // 所以：已经在主线程时就地起查询，用局部 run loop 驱动到收集完成或超时，不再派发。
-        // The metadata query must live on a thread with a run loop. The iOS shell calls dm_cloud_boot on a boot thread, so dispatching to the main thread is fine;
+        // The metadata query must live on a thread with a run loop. The iOS shell calls dm_icloud_boot on a boot thread, so dispatching to the main thread is fine;
         // but the Mac host calls it directly on the main thread in main() (main.c), where the main thread has not entered its run loop yet - dispatching to the main thread and then waiting on it deadlocks (always "gathering unfinished").
         // So: when already on the main thread, start the query in place and drive a local run loop until gathering finishes or the deadline passes.
         BOOL on_main = NSThread.isMainThread;
@@ -280,7 +280,7 @@ static int first_listing_ok(double deadline) {
         ok ? "看清了，同步" : "没看清，本次不同步（不上传、不建 saves_v2），下次启动再看");
     return ok;
 }
-void dm_cloud_boot(void) {
+void dm_icloud_boot(void) {
     const char *sv = getenv("DM_SAVE"), *sub = getenv("DM_TEST_ICLOUD_SUB"), *ldir = getenv("DM_TEST_ICLOUD_DIR"), *lroot = getenv("DM_TEST_ICLOUD_ROOT"); if (!sv) return;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *save = @(sv); int real = [save.stringByStandardizingPath isEqualToString:[doc stringByAppendingPathComponent:@"save"].stringByStandardizingPath];

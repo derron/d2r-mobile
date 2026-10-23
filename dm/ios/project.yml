@@ -56,6 +56,7 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: D2R Mobile
+        NSLocalNetworkUsageDescription: Connect to your NAS to sync game saves.
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)         # 构建号（testflight.sh 传月日时分）；xcodegen 缺省写死 1，TestFlight 会当重复构建 | Build number (testflight.sh passes month-day-hour-minute); xcodegen hardcodes 1 by default, which TestFlight treats as a duplicate build
         CFBundleShortVersionString: $(MARKETING_VERSION)
         SWUpdateURL: $(DM_UPDATE_URL)                       # 新版本提示查的版本文件地址（Sources/dm_update.m）；出包脚本传，地址不进仓库。空 = 不查不提示 | URL of the version file checked for the new-version prompt (Sources/dm_update.m); passed by the packaging script, the URL is not committed to the repository. Empty = no check, no prompt
