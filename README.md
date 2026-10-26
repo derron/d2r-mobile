@@ -148,7 +148,7 @@ Enter through the red portal in Harrogath after completing Hell. There are 100 l
 | Runeword helper | Long-press a socketed base to list the Runewords it can make and their stats; once you have the runes, socket them all in one tap |
 | Minimap guidance | Every map marks its Waypoint and exits; every quest goal is on the map; when a target is off screen, its name is written along the screen edge |
 | Chores removed | Free identification, free Town Portal with no scrolls needed, spawning right beside the Waypoint, Quick Restart, refreshable vendor stock |
-| Saves | Saved immediately when you switch apps, swipe the app away or quit; iCloud sync across devices (requires signing with a paid developer account) |
+| Saves | Saved immediately when you switch apps, swipe the app away or quit; iCloud sync across devices (requires signing with a paid developer account); [Optional WebDAV pack storage](docs/WEBDAV_SYNC.md) |
 
 Most features can be toggled one by one in game under Options → Custom.
 

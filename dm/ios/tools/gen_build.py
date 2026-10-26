@@ -12,7 +12,7 @@
 # Usage: gen_build.py <dm/host dir> <Gen dir>
 import os, shlex, subprocess, sys
 host, gen = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
-cmd = subprocess.run(['make', '-s', '-n', '-B', '-C', host, 'dmhost'], capture_output=True, text=True, check=True).stdout
+cmd = subprocess.run(['make', '-s', '-n', '-B', '-C', host, 'dmhost', 'WEBDAV=' + os.environ.get('DM_WEBDAV', '0')], capture_output=True, text=True, check=True).stdout
 toks = shlex.split(next(l for l in cmd.splitlines() if l.lstrip().startswith('clang')))
 srcs, incs, defs, fws = [], [], [], []
 i = 0

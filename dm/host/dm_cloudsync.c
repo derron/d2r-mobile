@@ -59,6 +59,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "dm.h"
+#include "dm_cloudsync.h"
 
 #define MAXF 64
 typedef struct { char path[256]; uint64_t mt; uint32_t size; uint8_t *data; } cs_file;   // path：相对存档目录 | path: relative to the save directory
@@ -281,10 +282,11 @@ static int state_load(const char *p, cs_state *s, int cap) {
     while (n < cap && fgets(ln, sizeof ln, f)) { unsigned long long h, t; int tb; char nm[64]; if (sscanf(ln, "%63[^\t]\t%llx\t%llu\t%d", nm, &h, &t, &tb) == 4) { strlcpy(s[n].unit, nm, sizeof s[n].unit); s[n].hash = h; s[n].stamp = t; s[n].tomb = tb; n++; } }
     fclose(f); return n;
 }
-static void state_save(const char *p, const cs_state *s, int n) {
-    char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.tmp", p); FILE *f = fopen(tmp, "w"); if (!f) return;
+static int state_save(const char *p, const cs_state *s, int n) {
+    char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.tmp", p); FILE *f = fopen(tmp, "w"); if (!f) return -1;
     for (int i = 0; i < n; i++) fprintf(f, "%s\t%llx\t%llu\t%d\n", s[i].unit, (unsigned long long)s[i].hash, (unsigned long long)s[i].stamp, s[i].tomb);
-    if (fclose(f) == 0) rename(tmp, p); else unlink(tmp);
+    int ok = !ferror(f); ok = fclose(f) == 0 && ok;
+    if (ok && !rename(tmp, p)) return 0; unlink(tmp); return -1;
 }
 static cs_state *state_get(cs_state *s, int *n, int cap, const char *unit, int add) {
     for (int i = 0; i < *n; i++) if (!strcmp(s[i].unit, unit)) return &s[i];
@@ -330,18 +332,49 @@ void dm_cloud_char_conflict_note(const char *unit) { char_conf_add(unit); }
 
 // 返回本次动作数（上传 + 下载 + 删除），-1 = 参数错。ready(单位) 返回 0 = 云端那份还没下载好（iCloud 占位），这一单位本次跳过。now_ms = 写删除标记用的时刻
 // Returns the number of actions this time (uploads + downloads + deletions), -1 = bad arguments. ready(unit) returning 0 = the cloud copy has not finished downloading yet (iCloud placeholder), and this unit is skipped this time. now_ms = the timestamp used when writing a deletion marker
-int dm_cloud_sync(const char *save, const char *cloud, const char *bak, const char *statef, int allow_down, uint64_t now_ms, int (*ready)(const char *unit)) {
+// 后端只负责包传输；发布返回成功以后才推进同步基线。
+// Backends transport packs only; advance the baseline only after publication succeeds.
+static int storage_unit(const char *unit) {
+    if (!unit || !*unit || strlen(unit) >= 64 || (*unit == '_' && strcmp(unit, "_stash")) || *unit == '.') return 0;
+    for (const unsigned char *p = (const unsigned char *)unit; *p; p++) if (*p < 32 || *p == 127 || *p == '/' || *p == '\\') return 0;
+    return 1;
+}
+typedef struct { char (*names)[64]; int *count; } cs_names;
+static int storage_emit(void *ctx, const char *unit) {
+    cs_names *n = ctx; if (!storage_unit(unit) || *n->count >= 256) return -1; add_name(n->names, n->count, unit); return 0;
+}
+static int storage_owner(const char *unit, const cs_unit *u) {
+    for (int i = 0; i < u->n; i++) {
+        const char *p = u->f[i].path; size_t len = strlen(unit);
+        if (!*p || *p == '/' || strchr(p, '\\') || strstr(p, "..") || strstr(p, "//")) return 0;
+        for (const unsigned char *q = (const unsigned char *)p; *q; q++) if (*q < 32 || *q == 127) return 0;
+        if (strcmp(unit, "_stash") ? (strncmp(p, unit, len) || p[len] != '/') : !is_stash(p)) return 0;
+        if (i && !strcmp(p, u->f[i - 1].path)) return 0;
+    }
+    return !u->tomb || !u->n;
+}
+static int storage_publish(const dm_cloud_storage *ops, const char *path, const char *unit, const cs_unit *u) {
+    if (pack_write(path, u)) return -1;
+    return ops ? ops->publish(ops->context, unit, path) : 0;
+}
+int dm_cloud_sync_backend(const char *save, const char *cloud, const char *bak, const char *statef, int allow_down, uint64_t now_ms, int (*ready)(const char *unit), const dm_cloud_storage *ops) {
     if (!save || !cloud || !bak || !statef) return -1;
-    static char names[256][64]; int nn = 0; static cs_state st[256]; int ns = state_load(statef, st, 256), acts = 0;
+    static char names[256][64]; int nn = 0; static cs_state st[256]; int ns = state_load(statef, st, 256), acts = 0, failed = 0;
+    if (ops && (!ops->list || !ops->read || !ops->publish)) return -1;
     DIR *dp = opendir(save); struct dirent *e; while (dp && (e = readdir(dp))) { if (is_char_dir(save, e->d_name)) add_name(names, &nn, e->d_name); else if (is_stash(e->d_name)) add_name(names, &nn, "_stash"); } if (dp) closedir(dp);
-    dp = opendir(cloud); while (dp && (e = readdir(dp))) { size_t l = strlen(e->d_name); if (e->d_name[0] != '.' && l > 5 && !strcmp(e->d_name + l - 5, ".pack")) { char nm[64]; if (l - 5 < sizeof nm) { memcpy(nm, e->d_name, l - 5); nm[l - 5] = 0; add_name(names, &nn, nm); } } } if (dp) closedir(dp);
+    if (ops) { cs_names n = {names, &nn}; if (ops->list(ops->context, storage_emit, &n)) return -1; }
+    else { dp = opendir(cloud); while (dp && (e = readdir(dp))) { size_t l = strlen(e->d_name); if (e->d_name[0] != '.' && l > 5 && !strcmp(e->d_name + l - 5, ".pack")) { char nm[64]; if (l - 5 < sizeof nm) { memcpy(nm, e->d_name, l - 5); nm[l - 5] = 0; add_name(names, &nn, nm); } } } if (dp) closedir(dp); }
     for (int i = 0; i < ns; i++) add_name(names, &nn, st[i].unit);
     for (int k = 0; k < nn; k++) {
         const char *un = names[k]; if (ready && !ready(un)) { LOG("iCloud 同步：%s 云端那份还没下载好，本次跳过", un); continue; }
         char cp[1300]; snprintf(cp, sizeof cp, "%s/%s.pack", cloud, un);
-        cs_unit *L = calloc(1, sizeof *L), *C = calloc(1, sizeof *C); int hl = local_read(save, un, L), hc = pack_read(cp, C);
+        cs_unit *L = calloc(1, sizeof *L), *C = calloc(1, sizeof *C); int hl = L ? local_read(save, un, L) : -1, hc = -1;
+        if (ops && (!storage_unit(un) || !L || !C)) failed = 1;
+        else { int fetched = ops ? ops->read(ops->context, un, cp) : 1;
+            hc = fetched > 0 && C ? pack_read(cp, C) : fetched;
+            if (ops && (hc < 0 || (hc > 0 && !storage_owner(un, C)))) { failed = 1; hc = -1; } }
         cs_state *S = state_get(st, &ns, 256, un, 0);
-        if (hl < 0 || hc < 0) { LOG("【红】iCloud 同步：%s %s读不了，本次跳过", un, hl < 0 ? "本地" : "云端包"); goto next; }
+        if (hl < 0 || hc < 0) { if (ops) failed = 1; LOG("【红】iCloud 同步：%s %s读不了，本次跳过", un, hl < 0 ? "本地" : "云端包"); goto next; }
         int lchg = hl ? (!S || S->tomb || L->hash != S->hash) : (S && !S->tomb);   // 本地自上次同步后改过（没有了也算改：被删了） | changed locally since the last sync (being gone also counts as a change: it was deleted)
         int cchg = hc && (!S || C->stamp != S->stamp || C->tomb != S->tomb);         // 云端没有包 = 没有消息，不算改 | no pack in the cloud = no news, does not count as a change
         cs_state *W = NULL; enum { NONE, UP, DOWN, DEL_LOCAL, TOMB } act = NONE;
@@ -365,13 +398,13 @@ int dm_cloud_sync(const char *save, const char *cloud, const char *bak, const ch
             else if (act == UP) fork = stash_shrinks(L, C, why, sizeof why) != NULL;
             if (fork) {
                 if (!allow_down) { LOG("iCloud 同步：_stash 分叉（%s），运行中不动，等下次启动收进收件箱", why); goto next; }
-                if (stash_has_stuff(L) && inbox_put(save, statef, L, S ? S->hash : 0, why, "本机")) goto next;   // 收不进收件箱：这次不动 | cannot store it in the inbox: leave everything this time
+                if (stash_has_stuff(L) && inbox_put(save, statef, L, S ? S->hash : 0, why, "本机")) { if (ops) failed = 1; goto next; }   // 收不进收件箱：这次不动 | cannot store it in the inbox: leave everything this time
                 act = DOWN; } }
         if (act == UP) {
-            if (hc && !C->tomb && C->hash != L->hash && cchg && backup_copy(bak, un, C, "云端（被本机后写覆盖）")) goto next;
+            if (hc && !C->tomb && C->hash != L->hash && cchg && backup_copy(bak, un, C, "云端（被本机后写覆盖）")) { if (ops) failed = 1; goto next; }
             if (!strcmp(un, "_stash") && allow_down && hc && !C->tomb && C->hash != L->hash && chron_union_unit(L, C, "云端那份") > 0) {   // 编年史并集：启动时（游戏还没读档）先写回本地再上传；运行中不动本地 | Chronicle union: at startup (game has not loaded saves yet) write back locally first, then upload; at runtime leave local untouched
-                uint64_t st0 = L->stamp; if (write_files(save, L)) { LOG("【红】iCloud 同步：%s 并好的编年史写不回本地 errno=%d，本次不上传", un, errno); goto next; } unit_finish(L); L->stamp = st0; }
-            L->tomb = 0; if (pack_write(cp, L)) { LOG("【红】iCloud 同步：%s 上传失败 errno=%d", un, errno); goto next; }
+                uint64_t st0 = L->stamp; if (write_files(save, L)) { if (ops) failed = 1; LOG("【红】iCloud 同步：%s 并好的编年史写不回本地 errno=%d，本次不上传", un, errno); goto next; } unit_finish(L); L->stamp = st0; }
+            L->tomb = 0; if (storage_publish(ops, cp, un, L)) { failed = ops != NULL; LOG("【红】iCloud 同步：%s 上传失败 errno=%d", un, errno); goto next; }
             LOG("iCloud 同步：%s 上传（时刻 %llu，%d 个文件）", un, (unsigned long long)L->stamp, L->n); acts++;
             W = state_get(st, &ns, 256, un, 1); if (W) { W->hash = L->hash; W->stamp = L->stamp; W->tomb = 0; }
             if (!strcmp(un, "_stash")) base_put(statef, L);
@@ -379,25 +412,30 @@ int dm_cloud_sync(const char *save, const char *cloud, const char *bak, const ch
             uint64_t ch = C->hash; cs_unit *O = NULL;   // O = 云端原样（并编年史之前），基准要记它（下次分叉判「云端是不是基准的后代」用） | O = the cloud as is (before Chronicle merge); the baseline must record it (used on the next fork to decide "is the cloud a descendant of the baseline")
             if (!strcmp(un, "_stash") && hl && L->hash != C->hash && (O = malloc(sizeof *O))) { *O = *C; for (int i = 0; i < O->n; i++) { O->f[i].data = malloc(C->f[i].size + 1); memcpy(O->f[i].data, C->f[i].data, C->f[i].size); }
                 if (chron_union_unit(C, L, "本机那份") > 0) { uint64_t st0 = C->stamp; unit_finish(C); C->stamp = st0; } }   // 编年史并集：本机那份找到过的条目并进要换进来的云端那份 | Chronicle union: entries found in the local copy are merged into the cloud copy being swapped in
-            if (local_apply(save, bak, un, hl ? L : NULL, C)) { if (O) { unit_free(O); free(O); } LOG("【红】iCloud 同步：%s 下载后换进本地失败 errno=%d（本地不变）", un, errno); goto next; }
+            if (local_apply(save, bak, un, hl ? L : NULL, C)) { if (ops) failed = 1; if (O) { unit_free(O); free(O); } LOG("【红】iCloud 同步：%s 下载后换进本地失败 errno=%d（本地不变）", un, errno); goto next; }
             LOG("iCloud 同步：%s 下载（时刻 %llu，%d 个文件）", un, (unsigned long long)C->stamp, C->n); acts++;
             if (!S && hl && strcmp(un, "_stash")) { char_conf_add(un); LOG("iCloud 同步：%s 两台设备各有一份同名角色，用云端那份，本机那份已进备份；进局提示", un); }
             W = state_get(st, &ns, 256, un, 1); if (W) { W->hash = ch; W->stamp = C->stamp; W->tomb = 0; }   // 记云端原样的摘要：并过编年史的本地 ≠ 它 → 下次同步当本地改过、传上去 | Record the digest of the cloud as is: a local copy with the Chronicle merged ≠ it → on next sync it is treated as locally modified and uploaded
             if (!strcmp(un, "_stash")) base_put(statef, O ? O : C);
             if (O) { unit_free(O); free(O); }
         } else if (act == DEL_LOCAL) {
-            { char d[1300]; if (move_to_bak(save, bak, un, L, "本机（另一台删了这个角色）", d, sizeof d)) goto next; }   // 删 = 整份挪进备份，挪不动就不删 | delete = move the whole copy into the backup; if it cannot be moved, do not delete
+            { char d[1300]; if (move_to_bak(save, bak, un, L, "本机（另一台删了这个角色）", d, sizeof d)) { if (ops) failed = 1; goto next; } }   // 删 = 整份挪进备份，挪不动就不删 | delete = move the whole copy into the backup; if it cannot be moved, do not delete
             LOG("iCloud 同步：%s 另一台删了，本机也删（备份已留）", un); acts++;
             W = state_get(st, &ns, 256, un, 1); if (W) { W->hash = 0; W->stamp = C->stamp; W->tomb = 1; }
         } else if (act == TOMB) {
-            cs_unit t = { .tomb = 1, .stamp = now_ms }; if (pack_write(cp, &t)) { LOG("【红】iCloud 同步：%s 写删除标记失败 errno=%d", un, errno); goto next; }
+            cs_unit t = { .tomb = 1, .stamp = now_ms }; if (storage_publish(ops, cp, un, &t)) { failed = ops != NULL; LOG("【红】iCloud 同步：%s 写删除标记失败 errno=%d", un, errno); goto next; }
             LOG("iCloud 同步：%s 本机删了，云端记删除标记", un); acts++;
             W = state_get(st, &ns, 256, un, 1); if (W) { W->hash = 0; W->stamp = now_ms; W->tomb = 1; }
         } else if (hc) { W = state_get(st, &ns, 256, un, 1); if (W) { W->hash = C->tomb ? 0 : C->hash; W->stamp = C->stamp; W->tomb = C->tomb; }   // 一致：记成已同步 | identical: record as synced
             if (!strcmp(un, "_stash") && !C->tomb && (!S || S->hash != C->hash || base_missing(statef))) base_put(statef, C); }
     next:
-        unit_free(L); unit_free(C); free(L); free(C);
+        if (L) { unit_free(L); free(L); } if (C) { unit_free(C); free(C); }
+        if (failed) break;
     }
-    state_save(statef, st, ns);
-    return acts;
+    if (state_save(statef, st, ns) && ops) failed = 1;
+    return failed ? -1 : acts;
+}
+
+int dm_cloud_sync(const char *save, const char *cloud, const char *bak, const char *statef, int allow_down, uint64_t now_ms, int (*ready)(const char *unit)) {
+    return dm_cloud_sync_backend(save, cloud, bak, statef, allow_down, now_ms, ready, NULL);
 }

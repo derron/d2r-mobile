@@ -8,3 +8,5 @@ local.env
 # 由原版图 / 表生成的（构建时从玩家自己的游戏文件生成，不进仓库；tools/gen_assets.py）
 Sources/TouchArt/dm_native_*.png
 Sources/dm_touch_native_art.c
+
+project_webdav.yml

@@ -15,6 +15,9 @@ R=${DM_ROOT:-$HOME/dm-work}/run/ios; mkdir -p "$R/out"
 DD=${DM_IOS_DD:-$R/dd}
 APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
 t(){ echo "[$(date +%T)] $*"; }
+# 可选后端必须同时重生成代码配置和界面布局。
+# Regenerate both compilation settings and layout for the optional backend.
+export DM_WEBDAV=${DM_IOS_WEBDAV:-0}
 OUT=${DM_OUT:-$(bash "../tools/product.sh" path touch)}; MODS="main sdk"
 # 可选：静态链接 FFmpeg，让 movie:: 走 VP8 解码并真正显示过场。默认仍为空播。
 MOVIE_FFMPEG=${DM_MOVIE_FFMPEG:-0}
@@ -93,9 +96,14 @@ if [ "$1" = build ]; then
   # A free developer account (personal team) cannot sign these entitlements: with DM_FREE_ACCOUNT=1 they are removed from the project description before generating. What is lost is iCloud save sync,
   # sustained execution mode and the higher memory limit; the game runs as usual (the address reservation is sized to fit without extended virtual addressing as well, see host/hle_svc.c)
   # The two switches are independent and can be combined: first remove what the free tier cannot sign, then change the deployment target for the older-API build (most public users have free accounts, and "free account + iOS 18" needs both to take effect). Neither set = generate as is
-  SPEC=project.yml; FREE=
+  SPEC=project.yml
+  if [ "$DM_WEBDAV" = 1 ]; then
+    python3 tools/project_webdav.py "$SPEC" project_webdav.yml || exit 1
+    SPEC=project_webdav.yml
+  fi
+  FREE=
   if [ "${DM_FREE_ACCOUNT:-0}" = 1 ]; then
-    python3 tools/project_free.py project.yml project_free.yml || { t "🔴 DM_FREE_ACCOUNT：免费档的工程描述没生成（见上）"; exit 1; }   # 去掉签不了的六行权限与用不上的资源下载扩展 | remove the six entitlement lines it cannot sign and the asset download extension it has no use for
+    python3 tools/project_free.py "$SPEC" project_free.yml || { t "🔴 DM_FREE_ACCOUNT：免费档的工程描述没生成（见上）"; exit 1; }   # 去掉签不了的六行权限与用不上的资源下载扩展 | remove the six entitlement lines it cannot sign and the asset download extension it has no use for
     SPEC=project_free.yml; FREE=free
   fi
   if [ "${DM_IOS_M3:-0}" = 1 ]; then   # 旧接口版：图形后端不用 Metal 4，部署目标 iOS 18.0（tools/project_m3.py）；缺省不走这里 | older-API build: the graphics backend does not use Metal 4, deployment target iOS 18.0 (tools/project_m3.py); not taken by default
@@ -105,7 +113,7 @@ if [ "$1" = build ]; then
   if [ $SPEC = project.yml ]; then
   xcodegen generate -q >/dev/null || { t "🔴 xcodegen 失败"; exit 1; }
   else
-    xcodegen generate -q --spec $SPEC >/dev/null; XG=$?; rm -f project_free.yml project_m3.yml; [ $XG = 0 ] || { t "🔴 xcodegen 失败"; exit 1; }
+    xcodegen generate -q --spec $SPEC >/dev/null; XG=$?; rm -f project_free.yml project_m3.yml project_webdav.yml; [ $XG = 0 ] || { t "🔴 xcodegen 失败"; exit 1; }
     [ -z "$FREE" ] || t "按免费账号生成：不带 iCloud / 持续执行 / 增加内存上限 / 扩展虚拟寻址，也不带资源下载扩展（只占一个应用标识）"
     [ "${DM_IOS_M3:-0}" != 1 ] || t "按旧接口版生成：部署目标 iOS 18.0、图形后端不用 Metal 4"
   fi

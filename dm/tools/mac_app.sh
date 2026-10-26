@@ -38,7 +38,12 @@ if [ -n "$ICLOUD" ]; then
   [ "$EXPS" -gt "$(date +%s)" ] || { echo "🔴 $(basename "$PF") 已过期（${EXP}）：重新下载一份放进签名目录"; exit 3; }
   echo "签名用 profile：$(basename "$PF")（包标识 ${BID}，到期 ${EXP}）"
 fi
-make -C "$DM/host" ${M3:+dmhost_m3} > /dev/null
+# WebDAV 不要求付费 iCloud 签名；源码与布局共用开关。
+# WebDAV requires no paid iCloud signing; code and layout share the switch.
+export DM_WEBDAV=${DM_MAC_WEBDAV:-0}
+WEBDAV_INFO=
+if [ "$DM_WEBDAV" = 1 ]; then WEBDAV_INFO='<key>NSLocalNetworkUsageDescription</key><string>Connect to WebDAV to sync save packs.</string>'; fi
+make -C "$DM/host" WEBDAV="$DM_WEBDAV" ${M3:+dmhost_m3} > /dev/null
 MIN=$(make -s -C "$DM/host" print-macos-min${M3:+-m3})   # 最低系统版本：与编译宿主用的是同一个数（host/Makefile 的 MACOS_MIN / MACOS_MIN_M3） | minimum system version: the same number the host is compiled with (MACOS_MIN / MACOS_MIN_M3 in host/Makefile)
 APP="$OUT/$NAME.app"; rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$DM/host/dmhost${M3:+_m3}" "$APP/Contents/MacOS/D2RMobile"
@@ -122,7 +127,7 @@ ${ICON_KEY}
 <key>CFBundleVersion</key><string>$BUILD</string>
 <key>LSMinimumSystemVersion</key><string>$MIN</string>
 ${DM_MAC_UPDATE_URL:+<key>SWUpdateURL</key><string>$DM_MAC_UPDATE_URL</string>
-}<key>NSHighResolutionCapable</key><true/>
+}${WEBDAV_INFO}<key>NSHighResolutionCapable</key><true/>
 <key>LSApplicationCategoryType</key><string>public.app-category.role-playing-games</string>
 <key>GCSupportsControllerUserInteraction</key><true/>
 </dict></plist>

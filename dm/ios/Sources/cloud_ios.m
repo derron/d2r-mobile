@@ -27,6 +27,11 @@
 #include <stdatomic.h>
 #include "front.h"
 #include "hle.h"
+#include "webdav_settings.h"
+#if DM_WEBDAV
+static _Atomic int g_webdav;
+int dm_cloud_uses_webdav(void) { return atomic_load(&g_webdav); }
+#endif
 
 int dm_cloud_sync(const char *save, const char *cloud, const char *bak, const char *statef, int allow_down, uint64_t now_ms, int (*ready)(const char *unit));
 int dm_cloud_inbox_add(const char *save, const char *statef, const char *pack); uint64_t dm_cloud_pack_stamp(const char *pack);
@@ -86,6 +91,9 @@ static void take_conflicts(NSString *save) {
     }
 }
 static int run_sync(NSString *save, int down) {   // 在文件协调里做：iCloud 守护进程同时在写这个目录时不会读到半个文件 | Done inside file coordination: half-written files are not read while the iCloud daemon is writing this directory at the same time
+#if DM_WEBDAV
+    if (dm_cloud_uses_webdav()) return dm_webdav_run(save, g_bak, g_state, down);
+#endif
     __block int r = -1; NSError *err = nil;
     [[[NSFileCoordinator alloc] initWithFilePresenter:nil] coordinateWritingItemAtURL:[NSURL fileURLWithPath:g_cloud] options:NSFileCoordinatorWritingForMerging error:&err byAccessor:^(NSURL *u) {
         (void)u; if (down) take_conflicts(save);   // 只在启动那次（运行中 save 是提交快照目录，不放收件箱） | only at launch (while running, save is the commit snapshot directory; nothing goes into the inbox)
@@ -107,6 +115,11 @@ static NSString *g_pend;          // 局内最新一次提交的快照（只在 
 static _Atomic int g_bg;          // App 在后台：此时的提交（失活时请求的那次存盘）当场传 | App in background: a commit at this time (the save requested on resign active) is uploaded on the spot
 static _Atomic int g_session;     // 在一局里：进局（第一次出现局内画面）起，到游戏发「回到前端」（FrontEndNavigation:ToFrontEnd）为止——中间的读取画面（切幕 / 传送点）不算出局 | In a run: from entering the run (first appearance of the in-run picture) until the game sends "back to front end" (FrontEndNavigation:ToFrontEnd) -- loading screens in between (act change / waypoint) do not count as leaving the run
 static void upload_snap(NSString *snap, const char *why) {   // 在 g_q 上调 | Called on g_q
+#if DM_WEBDAV
+    if (dm_cloud_uses_webdav()) {
+        if (dm_custom_get("webdav")) { int n = run_sync(snap, 0); if (n < 0) { if (g_pend) [NSFileManager.defaultManager removeItemAtPath:g_pend error:nil]; g_pend = snap; return; } }
+    } else
+#endif
     if (dm_custom_get("icloud")) { int n = run_sync(snap, 0); LOG("iCloud 同步：%s上传 %d 个", why, n); }
     [NSFileManager.defaultManager removeItemAtPath:snap error:nil];
 }
@@ -280,6 +293,33 @@ static int first_listing_ok(double deadline) {
         ok ? "看清了，同步" : "没看清，本次不同步（不上传、不建 saves_v2），下次启动再看");
     return ok;
 }
+static void start_sync(double t0) {
+    g_q = dispatch_queue_create("dm.cloud", DISPATCH_QUEUE_SERIAL);
+#if DM_WEBDAV
+    if (dm_cloud_uses_webdav()) { NSString *scratch, *backup, *state; if (!dm_webdav_prepare(g_save, g_q, &scratch, &backup, &state)) return; g_cloud = scratch; g_bak = backup; g_state = state; }
+#endif
+    NSString *save = g_save;
+    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:save.stringByDeletingLastPathComponent error:nil] ?: @[])   // 上次被杀时没删掉的提交快照 | Commit snapshots not deleted when we were last killed
+        if ([f hasPrefix:[save.lastPathComponent stringByAppendingString:@".cloudsnap"]]) [NSFileManager.defaultManager removeItemAtPath:[save.stringByDeletingLastPathComponent stringByAppendingPathComponent:f] error:nil];
+    double t1 = CFAbsoluteTimeGetCurrent(); int pend = 0;
+#if DM_WEBDAV
+    if (!dm_cloud_uses_webdav())
+#endif
+    pend = pending_downloads(1);
+    while (pend && CFAbsoluteTimeGetCurrent() - t0 < 5.0) { usleep(100000); pend = pending_downloads(0); }
+    double t2 = CFAbsoluteTimeGetCurrent(); int n = run_sync(save, 1);
+#if DM_WEBDAV
+    if (dm_cloud_uses_webdav()) fprintf(stderr, "WebDAV startup result=%d\n", n);
+    else {
+#endif
+    LOG("iCloud 同步：启动分段 取容器与查齐 %.0f ms、等下载 %.0f ms、文件协调与同步 %.0f ms", (t1 - t0) * 1000, (t2 - t1) * 1000, (CFAbsoluteTimeGetCurrent() - t2) * 1000);
+    LOG("iCloud 同步：启动 %.0f ms，动作 %d 个%s（云端目录 %s）", (CFAbsoluteTimeGetCurrent() - t0) * 1000, n, pend ? [NSString stringWithFormat:@"，%d 个包没等到下载完、本次跳过", pend].UTF8String : "", getenv("DM_TEST_ICLOUD_DIR") ? "本地测试目录" : getenv("DM_TEST_ICLOUD_SUB") ?: "saves_v2");
+#if DM_WEBDAV
+    }
+#endif
+    g_dm_save_commit_hook = on_commit;
+    { extern void (*g_dm_ingame_hook)(int); extern void (*g_dm_charsel_hook)(void); g_dm_ingame_hook = cloud_ingame; g_dm_charsel_hook = cloud_charsel; }   // 进局记一局开始；回到前端 = 这一局结束，传一次 | Entering a run marks the start of a run; returning to the front end = this run has ended, upload once
+}
 void dm_cloud_boot(void) {
     const char *sv = getenv("DM_SAVE"), *sub = getenv("DM_TEST_ICLOUD_SUB"), *ldir = getenv("DM_TEST_ICLOUD_DIR"), *lroot = getenv("DM_TEST_ICLOUD_ROOT"); if (!sv) return;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -288,11 +328,26 @@ void dm_cloud_boot(void) {
     real = getenv("DM_CLOUD_REAL") != NULL; (void)doc;   // Mac：真实存档由启动代码认（app_mac.m：没带 DM_APP_SUPPORT 的那种起法） | Mac: the real save is recognised by the startup code (app_mac.m: the way of launching without DM_APP_SUPPORT)
 #endif
     int off = getenv("DM_TEST_ICLOUD_OFF") != NULL;                   // 测试总闸：脚本起的局一律带它（tools/cloud_guard.sh），整局不同步 | Test master gate: runs launched by scripts always carry it (tools/cloud_guard.sh), and the whole run does not sync
-    if (!real && !sub && !ldir && !lroot) { if (off) LOG("iCloud 同步：测试开关 DM_TEST_ICLOUD_OFF，本局不同步");   // 测试存档：不同步 | Test save: not synced
+#if DM_WEBDAV
+    int dav_test = dm_webdav_test_mode();
+#else
+    int dav_test = 0;
+#endif
+    if (!real && !sub && !ldir && !lroot && !dav_test) { if (off) LOG("iCloud 同步：测试开关 DM_TEST_ICLOUD_OFF，本局不同步");   // 测试存档：不同步 | Test save: not synced
 #if TARGET_OS_OSX
         else LOG("iCloud 同步：测试用的存档目录（DM_APP_SUPPORT），本局不同步");
 #endif
         return; }
+#if DM_WEBDAV
+    dm_webdav_load_configuration();
+    if (dm_custom_get("webdav")) {
+        // 后端选择固定到下次启动；测试存档不会进入真实远端。
+        // Backend selection is fixed until restart; test saves never reach a real remote.
+        atomic_store(&g_webdav, 1);
+        if ((off && !dav_test) || (!real && !dav_test) || (getenv("DM_SAVE_FRESH") && !dav_test)) return;
+        g_save = save; start_sync(CFAbsoluteTimeGetCurrent()); return;
+    }
+#endif
     // Mac 上跑的 iOS 包：缺省整个不连真实 iCloud。这个包只发 iPhone / iPad，Mac 上跑的全是开发与测试；开发机登着真实账号时，
     // 它就是那个账号的又一台设备，任何脚本、手点图标都会和真实云端双向同步（出过把测试存档传进真实云端）。本地测试云端（DIR / ROOT）不受影响；
     // 真要在 Mac 上连真实云端：同时给 DM_REAL_ICLOUD=1 与 DM_REAL_ICLOUD_CONFIRM=写入真实云端。真机不走这一支。
@@ -315,14 +370,5 @@ void dm_cloud_boot(void) {
     [NSFileManager.defaultManager createDirectoryAtPath:g_cloud withIntermediateDirectories:YES attributes:nil error:nil];
     g_save = save; g_bak = [save stringByAppendingString:@".cloudbak"]; g_state = [save stringByAppendingString:@".cloudstate"];
     if (ldir) { g_bak = [g_cloud stringByAppendingString:@".cloudbak"]; g_state = [g_cloud stringByAppendingString:@".cloudstate"]; }   // 测试的本地云端：状态与备份跟云端目录走，不与真存档（同一路径、连真实 iCloud 时）共用——共用的话测试局会改写真存档的同步状态 | Local cloud for tests: state and backup follow the cloud directory and are not shared with the real save (same path, when connected to real iCloud) -- if shared, test runs would rewrite the real save's sync state
-    g_q = dispatch_queue_create("dm.cloud", DISPATCH_QUEUE_SERIAL);
-    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:save.stringByDeletingLastPathComponent error:nil] ?: @[])   // 上次被杀时没删掉的提交快照 | Commit snapshots not deleted when we were last killed
-        if ([f hasPrefix:[save.lastPathComponent stringByAppendingString:@".cloudsnap"]]) [NSFileManager.defaultManager removeItemAtPath:[save.stringByDeletingLastPathComponent stringByAppendingPathComponent:f] error:nil];
-    double t1 = CFAbsoluteTimeGetCurrent(); int pend = pending_downloads(1);
-    while (pend && CFAbsoluteTimeGetCurrent() - t0 < limit) { usleep(100000); pend = pending_downloads(0); }
-    double t2 = CFAbsoluteTimeGetCurrent(); int n = run_sync(save, 1);
-    LOG("iCloud 同步：启动分段 取容器与查齐 %.0f ms、等下载 %.0f ms、文件协调与同步 %.0f ms", (t1 - t0) * 1000, (t2 - t1) * 1000, (CFAbsoluteTimeGetCurrent() - t2) * 1000);
-    LOG("iCloud 同步：启动 %.0f ms，动作 %d 个%s（云端目录 %s）", (CFAbsoluteTimeGetCurrent() - t0) * 1000, n, pend ? [NSString stringWithFormat:@"，%d 个包没等到下载完、本次跳过", pend].UTF8String : "", ldir ? "本地测试目录" : sub ? sub : "saves_v2");
-    g_dm_save_commit_hook = on_commit;
-    { extern void (*g_dm_ingame_hook)(int); extern void (*g_dm_charsel_hook)(void); g_dm_ingame_hook = cloud_ingame; g_dm_charsel_hook = cloud_charsel; }   // 进局记一局开始；回到前端 = 这一局结束，传一次 | Entering a run marks the start of a run; returning to the front end = this run has ended, upload once
+    start_sync(t0);
 }

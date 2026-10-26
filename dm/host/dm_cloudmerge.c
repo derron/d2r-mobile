@@ -32,6 +32,7 @@
 //   after an item is placed in the inventory, the pre-commit hook (disk write thread) only removes it from the list once it finds the placed bitstream in the character save of this commit; gold is removed only when the modification time of the shared stash file in this commit is later than the moment gold was added.
 //   List empty = this stash type is fully merged. mine.pack / base.pack are kept for part three (Chronicle segment union); the entry directory is not deleted.
 // Threads: dm_cloudmerge_srv_tick runs on the server tick (diag.c hud_tick); the pre-commit hook cm_hook runs on the disk write thread (holding the save lock); both take g_mu.
+#include "dm_cloudsync.h"
 #include "hle.h"
 #include "dm_i18n.h"
 #include <dirent.h>
@@ -330,8 +331,8 @@ void dm_cloudmerge_srv_tick(uint8_t *b, uint64_t G, uint64_t player) {
     if (g_gold > 0 && !g_gold_sent) { add_gold(G, player); saved |= g_gold_sent != 0; }
     for (int i = 0, miss = 0; i < g_plan.n && g_npend < 32 && miss < 8; i++) { if (pend_has(i)) continue; int r = take_one(G, player, i); if (r > 0) saved = 1; else if (r == 0) { full = 1; miss++; } }   // 大件放不下时接着试小件，一拍最多试 8 件放不下的 | When a large item does not fit, keep trying smaller ones; at most 8 non-fitting items are tried per tick
     int left = g_plan.n - g_npend, done = !g_plan.n && g_gold <= 0 && !g_npend && !g_dirty, pend = g_npend || g_gold_sent || g_dirty;
-    static int said; if (saved && !said) { said = 1; snprintf(g_notice, sizeof g_notice, "%s", dm_str(b, "dmCloudMergeBack")); atomic_store(&g_notice_req, 1); }
-    if (full && left) { static uint32_t fl; if (!fl || tq - fl > 750) { fl = tq; snprintf(g_notice, sizeof g_notice, "%s", dm_str(b, "dmCloudMergeFull")); atomic_store(&g_notice_req, 1); } }
+    static int said; if (saved && !said) { said = 1; snprintf(g_notice, sizeof g_notice, "%s", dm_str(b, DM_CLOUD_NOTICE("dmCloudMergeBack", "dmDavMergeBack"))); atomic_store(&g_notice_req, 1); }
+    if (full && left) { static uint32_t fl; if (!fl || tq - fl > 750) { fl = tq; snprintf(g_notice, sizeof g_notice, "%s", dm_str(b, DM_CLOUD_NOTICE("dmCloudMergeFull", "dmDavMergeFull"))); atomic_store(&g_notice_req, 1); } }
     if (done) { LOG("iCloud 并回：%s 的 %s 并完", g_entry, g_stash); none = !entry_pick(wd); said = 0; }
     pthread_mutex_unlock(&g_mu);
     { static uint32_t lastreq; if (saved || (pend && tq - lastreq >= 50)) { lastreq = tq; dm_request_save(); } }
